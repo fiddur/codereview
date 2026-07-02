@@ -1,0 +1,61 @@
+# Example stack for the aurboda docker tryout.
+#
+# Copy to docker-compose.yml and fill in throwaway, LOCAL-ONLY credentials — the
+# real file is gitignored because it carries secrets. This DB is ephemeral: it is
+# torn down and rebuilt for every tryout run, so the values only ever need to be
+# consistent between the two services below, never real production secrets.
+#
+# Docker images are tagged as:
+#   latest  - stable releases (from main branch)
+#   develop - development builds (from develop branch)
+
+# Project name is pinned so volumes and containers keep their identity
+# regardless of which directory `docker compose` is invoked from.
+name: aurboda-tryout
+
+services:
+  aurboda:
+    image: fiddur/aurboda:develop
+    ports:
+      - '8080:80'
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=aurboda_service
+      - PGPASSWORD=CHANGEME_LOCAL_ONLY
+      - SESSION_SECRET=CHANGEME_LOCAL_ONLY
+      - ALLOW_SIGNUP=${ALLOW_SIGNUP:-true}
+      - WEB_HOST=http://localhost:8080
+      - NODE_ENV=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    command: postgres -c max_connections=200
+    environment:
+      - POSTGRES_USER=aurboda_service
+      - POSTGRES_PASSWORD=CHANGEME_LOCAL_ONLY   # must match PGPASSWORD above
+      - POSTGRES_DB=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aurboda_service']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

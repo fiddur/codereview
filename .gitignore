@@ -1,0 +1,34 @@
+node_modules
+work
+*.log
+.env
+
+# machine-specific config (real repos, paths, domains). Committed counterparts:
+# src/targets.example.ts and the repos.local fallback documented in the script.
+src/targets.local.ts
+repos.local
+
+# local harness / editor state
+.claude/
+
+# tryout: runtime state and per-run workspaces (the .mjs scripts are checked in)
+tryout/runs
+tryout/shots
+tryout/token.txt
+tryout/*/token.txt
+tryout/*/shots
+
+# tryout: secrets & data dumps
+#  - docker-compose.yml carries local throwaway DB creds; a scrubbed
+#    docker-compose.example.yml is committed in its place
+#  - state.json holds live magic-link auth tokens
+#  - settings.json is a personal settings dump
+tryout/docker-compose.yml
+tryout/settings.json
+tryout/*/state.json
+tryout/*/state.json.bak
+
+# app-specific deployed-tryout subdirs kept out of the public repo; the real
+# signup script + stack stay on disk for the running pipeline. The aurboda
+# tryout scripts (tryout/*.mjs) remain as the checked-in example.
+tryout/*/
