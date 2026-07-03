@@ -85,6 +85,83 @@ export function recentOutput(err: unknown): string {
   return '';
 }
 
+// All the text we can scrape a failure signature out of: the captured tail of
+// the child's output plus the Error message.
+export function errText(err: unknown): string {
+  return recentOutput(err) + (err instanceof Error ? ` ${err.message}` : '');
+}
+
+// The hard daily/session usage cap (distinct from a transient rate limit). Not
+// retryable in-process — it only clears at the stated reset time.
+export function isSessionLimitError(err: unknown): boolean {
+  if (err instanceof AbortedError) return false;
+  return /session limit/i.test(errText(err));
+}
+
+// The limit message looks like: "You've hit your session limit · resets 5pm
+// (Europe/Stockholm)" or "... resets 1:40pm (Europe/Stockholm)".
+const RESET_RE = /resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?/i;
+
+export function parseResetClock(
+  text: string,
+): { hour24: number; minute: number; tz: string } | null {
+  const m = RESET_RE.exec(text);
+  if (!m) return null;
+  let hour24 = Number(m[1]);
+  const minute = m[2] ? Number(m[2]) : 0;
+  const ap = (m[3] ?? '').toLowerCase();
+  if (ap === 'pm' && hour24 !== 12) hour24 += 12;
+  if (ap === 'am' && hour24 === 12) hour24 = 0;
+  return { hour24, minute, tz: m[4]?.trim() || 'Europe/Stockholm' };
+}
+
+// Current wall-clock (hour/minute/second) in the given IANA timezone. Falls back
+// to Europe/Stockholm if the tz string is unusable.
+export function wallClockNow(
+  now: Date,
+  tz: string,
+): { hour: number; minute: number; second: number } {
+  const makeFmt = (zone: string): Intl.DateTimeFormat =>
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: zone, hour12: false,
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  let fmt: Intl.DateTimeFormat;
+  try {
+    fmt = makeFmt(tz);
+  } catch {
+    fmt = makeFmt('Europe/Stockholm');
+  }
+  const parts = fmt.formatToParts(now);
+  const get = (t: string): number => Number(parts.find((p) => p.type === t)?.value ?? '0');
+  let hour = get('hour');
+  if (hour === 24) hour = 0; // en-GB 2-digit renders midnight as "24"
+  return { hour, minute: get('minute'), second: get('second') };
+}
+
+// Resolve the reset phrase in `text` to an absolute instant: the next occurrence
+// of that wall-clock time in its timezone, plus a small buffer so freshly-reset
+// quota has propagated. Returns null when there's no parseable reset time.
+export function sessionLimitResetAt(
+  text: string,
+  now: Date = new Date(),
+  bufferMs = 120_000,
+): Date | null {
+  const clock = parseResetClock(text);
+  if (clock === null) return null;
+  const wall = wallClockNow(now, clock.tz);
+  const targetMin = clock.hour24 * 60 + clock.minute;
+  const nowMin = wall.hour * 60 + wall.minute + wall.second / 60;
+  let deltaMin = targetMin - nowMin;
+  if (deltaMin < 0) {
+    // Reset already passed today. The message is emitted *before* the reset, so
+    // a small negative delta is just clock skew / a slightly stale parse — fire
+    // almost immediately. Only a clearly-earlier time means "tomorrow".
+    deltaMin = deltaMin > -60 ? 0 : deltaMin + 24 * 60;
+  }
+  return new Date(now.getTime() + deltaMin * 60_000 + bufferMs);
+}
+
 const TRANSIENT_PATTERNS = [
   /API Error: 5\d\d/,
   /\bOverloaded\b/i,

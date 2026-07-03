@@ -32,6 +32,20 @@ Spawned Claude processes run with **all MCP servers disabled**
 explicitly wired for the docker tryout — so a review/tryout can never reach
 production.
 
+## Usage-limit auto-recovery
+
+Spawned Claude processes count against the account's usage cap. When a
+review/tryout dies on the hard **session limit**, the server parses the reset
+time from the failure output (`… resets 5pm (Europe/Stockholm)`), and re-fires
+that exact piece of work just after the reset — no human in the loop. Because it
+re-enters the normal scheduling path, a release tryout **resumes** from its
+partial `.review.json` rather than restarting. Pending recoveries coalesce onto a
+single timer; a fresh webhook for the same PR cancels its pending recovery so a
+stale SHA is never re-fired. (`src/recovery.ts`; reset parsing in `src/run.ts`.)
+
+`retrigger-stale.sh` remains as a manual belt-and-braces sweep — it re-fires any
+open non-draft PR whose latest review is behind its head SHA.
+
 ## How a tryout works (the agent writes its own scripts)
 
 The server doesn't ship a fixed test script per feature — it can't, because it
@@ -86,7 +100,8 @@ picks up where it left off rather than restarting.
 | `src/review.ts` | Review prompt, `.review.json` parsing, posting (with inline-comment anchoring + summary fallback) |
 | `src/release.ts` | Release-tryout pipeline, PR-body checklist parse/apply, resume support |
 | `src/tryout.ts` | Docker/deployed tryout targets, build-workflow wait, per-run MCP config |
-| `src/run.ts` | Child-process runner with abort + process-group kill, transient-API-failure retry |
+| `src/run.ts` | Child-process runner with abort + process-group kill, transient-API-failure retry, usage-limit reset-time parsing |
+| `src/recovery.ts` | Coalescing scheduler that re-fires usage-limit-failed work just after the reset |
 | `src/eventlog.ts` | Appends a line-per-event feed to `events.log` so sibling agents can `tail -F` instead of polling GitHub |
 | `retrigger.mjs` | Re-fire a synthetic (signed) webhook for one PR |
 | `retrigger-stale.sh` | Sweep open non-draft PRs and retrigger any whose latest review is behind head (e.g. after a session-limit blackout) |
@@ -134,5 +149,6 @@ pnpm check     # tsc --noEmit && node --test src/*.test.ts
 - Reviews work for any repo whose webhook reaches the server; **tryouts** need an
   app-specific stack and are enabled per-repo in `TRYOUT_TARGETS`.
 - Spawned Claude processes count against the account's usage limits. When a limit
-  is hit mid-run the affected review/tryout fails; `retrigger-stale.sh` recovers
-  everything once the limit resets.
+  is hit mid-run the affected review/tryout fails and is **auto-recovered** just
+  after the reset (see *Usage-limit auto-recovery* above); `retrigger-stale.sh` is
+  the manual fallback.

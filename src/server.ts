@@ -4,6 +4,8 @@ import { reviewPR, isAbortedError, type ReviewConfig } from './review.ts';
 import { tryoutPR, type TryoutConfig, type TryoutTarget, type DeployedTryoutTarget } from './tryout.ts';
 import { releaseTryoutPR } from './release.ts';
 import { appendPrEvent } from './eventlog.ts';
+import { errText, isSessionLimitError, sessionLimitResetAt } from './run.ts';
+import { createRecoveryScheduler } from './recovery.ts';
 // Repo → tryout-target config lives in a gitignored local module (real infra
 // details). Copy src/targets.example.ts to src/targets.local.ts and edit.
 import { TRYOUT_TARGETS } from './targets.local.ts';
@@ -34,6 +36,13 @@ const tryoutConfig: TryoutConfig = {
   timeoutDuration: process.env.TRYOUT_TIMEOUT ?? '30m',
   mcpConfigFallback: MCP_CONFIG,
 };
+
+// Auto-recovery for usage-limit failures: when a review/tryout dies on the
+// account's session cap, we re-fire it just after the stated reset instead of
+// losing it. `tryout:` keys are namespaced so a PR can hold both a review and a
+// docker-tryout recovery independently.
+const recovery = createRecoveryScheduler({ log: (m) => console.log(m) });
+const tryoutRecoveryKey = (repo: string, number: number): string => `tryout:${repo}#${number}`;
 
 type PRSlotKind = 'review' | 'release-tryout';
 type PRSlot = {
@@ -74,6 +83,10 @@ async function runPRChain(key: string, first: PullRequestEvent, slot: PRSlot): P
       } catch (err: unknown) {
         if (isAbortedError(err)) {
           console.log(`🛑 [${key}] ${label} aborted (SHA ${ev.pull_request.head.sha} superseded)`);
+        } else if (isSessionLimitError(err)) {
+          scheduleRecovery(key, `${label} ${key}`, err, () =>
+            schedulePR(key, ev, slot.kind, slot.releaseTarget),
+          );
         } else {
           console.error(`💥 [${key}] ${label} failed:`, err);
         }
@@ -91,12 +104,26 @@ async function runPRChain(key: string, first: PullRequestEvent, slot: PRSlot): P
   }
 }
 
+// Record a usage-limit failure for auto-recovery, or log it plainly if the reset
+// time can't be parsed (nothing to schedule against).
+function scheduleRecovery(key: string, label: string, err: unknown, redispatch: () => void): void {
+  const resetAt = sessionLimitResetAt(errText(err));
+  if (resetAt === null) {
+    console.error(`💥 [${key}] ${label} failed (usage limit, reset time unparsed):`, err);
+    return;
+  }
+  console.error(`💥 [${key}] ${label} failed (usage limit) — auto-recovery at ${resetAt.toISOString()}`);
+  recovery.record(key, resetAt, label, redispatch);
+}
+
 function schedulePR(
   key: string,
   event: PullRequestEvent,
   kind: PRSlotKind,
   releaseTarget?: DeployedTryoutTarget,
 ): void {
+  // A fresh event supersedes any pending usage-limit recovery for this PR.
+  recovery.cancel(key);
   const label = kind === 'release-tryout' ? 'release tryout' : 'review';
   const existing = slots.get(key);
   if (existing) {
@@ -119,13 +146,23 @@ const tryoutQueues = new Map<string, Promise<unknown>>();
 function scheduleTryout(event: PullRequestEvent, target: TryoutTarget): void {
   const repo = event.repository.full_name;
   const tag = `tryout ${repo}#${event.number}`;
+  recovery.cancel(tryoutRecoveryKey(repo, event.number));
+  const onFailure = (err: unknown): void => {
+    if (isSessionLimitError(err)) {
+      scheduleRecovery(tryoutRecoveryKey(repo, event.number), tag, err, () =>
+        scheduleTryout(event, target),
+      );
+    } else {
+      console.error(`💥 [${tag}] failed:`, err);
+    }
+  };
   const prev = tryoutQueues.get(repo) ?? Promise.resolve<unknown>(undefined);
   const next = prev
     .then(
       () => tryoutPR(event, target, tryoutConfig),
       () => tryoutPR(event, target, tryoutConfig),
     )
-    .catch((err: unknown) => console.error(`💥 [${tag}] failed:`, err));
+    .catch(onFailure);
   tryoutQueues.set(repo, next);
   next.finally(() => {
     if (tryoutQueues.get(repo) === next) tryoutQueues.delete(repo);
