@@ -23,6 +23,19 @@ const ALLOWED_TOOLS = [
   'Write(./.review.json)',
 ].join(' ');
 
+// CI already gates build/type-check/lint/format/tests on every PR, so a
+// reviewer re-running them adds no signal a green check doesn't — it just burns
+// time and tokens. The prompt says as much, but the checked-out repo's own
+// `.claude/settings.json` + AGENTS.md ("run `pnpm check`") tempt the agent into
+// it anyway; a deny rule wins over those. Reviewing needs only git/gh + reading,
+// never the toolchain, so blocking the package managers and runners is safe.
+const DISALLOWED_TOOLS = [
+  'Bash(pnpm:*)', 'Bash(npm:*)', 'Bash(npx:*)', 'Bash(yarn:*)', 'Bash(corepack:*)',
+  'Bash(node:*)', 'Bash(tsx:*)', 'Bash(vitest:*)', 'Bash(jest:*)',
+  'Bash(tsc:*)', 'Bash(tsgo:*)', 'Bash(oxlint:*)', 'Bash(oxfmt:*)',
+  'Bash(eslint:*)', 'Bash(prettier:*)', 'Bash(make:*)', 'Bash(docker:*)',
+].join(' ');
+
 const REVIEW_FILE = '.review.json';
 
 function buildPrompt(event: PullRequestEvent): string {
@@ -36,6 +49,8 @@ Base branch: ${pull_request.base.ref}
 Head branch: ${pull_request.head.ref}
 
 The PR head is already checked out (detached) in your current working directory, and \`origin/${pull_request.base.ref}\` is up to date. Review according to the code standards in this project's CLAUDE.md / AGENTS.md files and any in parent directories (e.g. /home/fiddur/src/CLAUDE.md).
+
+**Do NOT build, test, lint, type-check, or format the code, and do not install dependencies.** CI already gates every one of those on this PR — a green CI check is the source of truth for "does it build / do the tests pass / is it formatted", and re-running them here adds no signal while wasting time. Any instruction in CLAUDE.md / AGENTS.md to "run the checks", "run \`pnpm check\`", or "run the tests" is guidance for *authoring* changes, not for this review — ignore it here. Spend your effort instead on what CI cannot catch, by **reading** the diff and surrounding code and reasoning about it: logic and correctness bugs, security and authorization flaws, data-integrity and concurrency issues, API/DB/schema contract mismatches, missing or wrong edge-case handling, tests that don't actually assert what they claim, and clear violations of the documented standards. Reason about behavior from the source; don't execute it.
 
 Steps:
 1. Run \`git diff origin/${pull_request.base.ref}...HEAD\` and inspect changed files as needed.
@@ -345,6 +360,7 @@ export async function reviewPR(
         args: [
           '-p', buildPrompt(event),
           '--allowedTools', ALLOWED_TOOLS,
+          '--disallowedTools', DISALLOWED_TOOLS,
           '--mcp-config', config.mcpConfig,
           '--strict-mcp-config',
         ],
