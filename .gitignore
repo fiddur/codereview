@@ -11,6 +11,10 @@ repos.local
 # local harness / editor state
 .claude/
 
+# runtime stdout of the server (systemd StandardOutput / nohup) — contains PR
+# review bodies across repos, so it must stay out of the public repo
+server.out
+
 # tryout: runtime state and per-run workspaces (the .mjs scripts are checked in)
 tryout/runs
 tryout/shots
