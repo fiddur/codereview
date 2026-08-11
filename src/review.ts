@@ -20,7 +20,9 @@ const ALLOWED_TOOLS = [
   'Read',
   'Grep',
   'Glob',
-  'Write(./.review.json)',
+  // `Edit(path)`, not `Write(path)`: only Edit rules are path-matched, and they
+  // cover every file-editing tool — so this still lets the agent Write the file.
+  'Edit(./.review.json)',
 ].join(' ');
 
 // CI already gates build/type-check/lint/format/tests on every PR, so a

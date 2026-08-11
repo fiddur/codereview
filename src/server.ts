@@ -81,14 +81,20 @@ async function runPRChain(key: string, first: PullRequestEvent, slot: PRSlot): P
         await executeSlot(slot, ev, controller.signal);
         await appendPrEvent(EVENT_LOG, url, 'updated');
       } catch (err: unknown) {
+        // Every branch must write a terminal event. Watchers block until one
+        // arrives, so a failure that logged only to stdout was indistinguishable
+        // from a still-running job and hung them indefinitely.
         if (isAbortedError(err)) {
           console.log(`🛑 [${key}] ${label} aborted (SHA ${ev.pull_request.head.sha} superseded)`);
+          await appendPrEvent(EVENT_LOG, url, 'aborted');
         } else if (isSessionLimitError(err)) {
           scheduleRecovery(key, `${label} ${key}`, err, () =>
             schedulePR(key, ev, slot.kind, slot.releaseTarget),
           );
+          await appendPrEvent(EVENT_LOG, url, 'failed (retry scheduled)');
         } else {
           console.error(`💥 [${key}] ${label} failed:`, err);
+          await appendPrEvent(EVENT_LOG, url, 'failed');
         }
       } finally {
         slot.controller = null;
