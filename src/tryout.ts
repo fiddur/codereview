@@ -27,7 +27,10 @@ type CommonFields = {
   //   'bearer'         - a string used as Authorization: Bearer <token> (default)
   //   'magic-link-url' - a URL the agent navigates in puppeteer to establish a
   //                      browser session; useful when auth is session-cookie-based
-  tokenKind?: 'bearer' | 'magic-link-url';
+  //   'session-cookie' - the value of an HttpOnly session cookie; the agent
+  //                      sends it as `Cookie: <name>=<token>` (no bearer path),
+  //                      and sets it via page.setCookie in puppeteer
+  tokenKind?: 'bearer' | 'magic-link-url' | 'session-cookie';
 };
 
 export type DockerTryoutTarget = CommonFields & {
@@ -130,8 +133,11 @@ function buildPrompt(
 
   const tokenKind = target.tokenKind ?? 'bearer';
   const statePath = join(target.sharedDir, 'state.json');
+  const appOrigin = new URL(target.healthUrl).origin;
   const tokenDescription = tokenKind === 'magic-link-url'
     ? `**Auth model**: \`${tokenPath}\` contains a magic-link URL (not a bearer token). Navigate puppeteer to that URL — the redirect chain logs the browser in and lands you on /auth/callback signed in. \`${statePath}\` (if present) is a JSON file written alongside it with richer context: \`{ admin: { userId, email, actionLink }, test: { userId, email, actionLink } }\`. The test user is the default; switch to the admin link if you need to exercise \`/admin/*\` routes. For API-only checks (no browser), pull the Supabase JWT out of localStorage after the magic-link redirect and send it as \`Authorization: Bearer <jwt>\` — Supabase access tokens are valid for /api/* routes that accept session auth.`
+    : tokenKind === 'session-cookie'
+    ? `**Auth model**: \`${tokenPath}\` contains a **session cookie value** (an \`HttpOnly\` cookie), not a bearer token — this app authenticates by cookie only, there is no \`Authorization: Bearer\` path. \`${statePath}\` has \`{ cookieName, token, baseUrl, account: { id, email, roles } }\`; read \`cookieName\` from there rather than hard-coding it. For \`/api/*\` calls with curl, send it as a cookie: \`curl -H "Cookie: <cookieName>=$(cat ${tokenPath})" ${appOrigin}/api/...\`. For puppeteer, set the cookie before navigating — it is \`HttpOnly\`, so \`document.cookie\` cannot set it: \`await page.setCookie({ name: '<cookieName>', value: '<token>', url: '${appOrigin}', httpOnly: true })\`. The demo account holds the \`admin\` role, so admin-only routes are reachable. On a 401 the cookie has expired or the container's DB was reset — re-run \`${signupPath}\` to mint a fresh one.`
     : `**Auth model**: \`${tokenPath}\` is a bearer token. Use as \`Authorization: Bearer <token>\` for /api/* calls.`;
 
   const mcpSection = target.mcp
