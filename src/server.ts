@@ -1,10 +1,11 @@
+import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { isPullRequestEvent, reviewSkipReason, shouldReview, shouldTryout, verifySignature, type PullRequestEvent } from './webhook.ts';
+import { isIssueCommentEvent, isPullRequestEvent, resumeSkipReason, reviewSkipReason, shouldReview, shouldTryout, verifySignature, type PullRequestEvent } from './webhook.ts';
 import { reviewPR, isAbortedError, type ReviewConfig } from './review.ts';
 import { tryoutPR, type TryoutConfig, type TryoutTarget, type DeployedTryoutTarget } from './tryout.ts';
 import { releaseTryoutPR } from './release.ts';
 import { appendPrEvent } from './eventlog.ts';
-import { errText, isSessionLimitError, sessionLimitResetAt } from './run.ts';
+import { errText, isSessionLimitError, isTransientApiFailure, redispatchDelayMs, REDISPATCH_DELAYS_MS, sessionLimitResetAt } from './run.ts';
 import { createRecoveryScheduler } from './recovery.ts';
 // Repo → tryout-target config lives in a gitignored local module (real infra
 // details). Copy src/targets.example.ts to src/targets.local.ts and edit.
@@ -53,6 +54,16 @@ type PRSlot = {
 };
 const slots = new Map<string, PRSlot>();
 
+// How many times a PR has already been re-dispatched after a transient API
+// failure (see runPRChain). INVARIANT: this is cleared by a genuine webhook and
+// by a successful run — never by schedulePR, which the re-dispatch itself calls.
+// Clearing it there would reset the count on every retry and loop forever.
+const transientAttempts = new Map<string, number>();
+
+function clearTransientAttempts(key: string): void {
+  transientAttempts.delete(key);
+}
+
 async function executeSlot(
   slot: PRSlot,
   event: PullRequestEvent,
@@ -80,6 +91,7 @@ async function runPRChain(key: string, first: PullRequestEvent, slot: PRSlot): P
       try {
         await executeSlot(slot, ev, controller.signal);
         await appendPrEvent(EVENT_LOG, url, 'updated');
+        clearTransientAttempts(key);
       } catch (err: unknown) {
         // Every branch must write a terminal event. Watchers block until one
         // arrives, so a failure that logged only to stdout was indistinguishable
@@ -92,6 +104,31 @@ async function runPRChain(key: string, first: PullRequestEvent, slot: PRSlot): P
             schedulePR(key, ev, slot.kind, slot.releaseTarget),
           );
           await appendPrEvent(EVENT_LOG, url, 'failed (retry scheduled)');
+        } else if (isTransientApiFailure(err)) {
+          // run.ts already burned its in-process ladder (~2 minutes) on this.
+          // A 529 storm that outlasts that used to fall through to a plain
+          // `failed` and sit until a human re-fired it — weloveblueai#569 lost
+          // ~90 minutes that way. Re-dispatch on a longer, bounded schedule.
+          const attempt = transientAttempts.get(key) ?? 0;
+          const delay = redispatchDelayMs(attempt);
+          if (delay === null) {
+            clearTransientAttempts(key);
+            console.error(
+              `💥 [${key}] ${label} failed (transient API, ${attempt} re-dispatches exhausted):`,
+              err,
+            );
+            await appendPrEvent(EVENT_LOG, url, 'failed');
+          } else {
+            transientAttempts.set(key, attempt + 1);
+            const at = new Date(Date.now() + delay);
+            console.error(
+              `💥 [${key}] ${label} failed (transient API) — re-dispatch ${attempt + 1}/${REDISPATCH_DELAYS_MS.length} at ${at.toISOString()}`,
+            );
+            recovery.record(key, at, `${label} ${key} (transient retry ${attempt + 1})`, () =>
+              schedulePR(key, ev, slot.kind, slot.releaseTarget),
+            );
+            await appendPrEvent(EVENT_LOG, url, 'failed (retry scheduled)');
+          }
         } else {
           console.error(`💥 [${key}] ${label} failed:`, err);
           await appendPrEvent(EVENT_LOG, url, 'failed');
@@ -154,10 +191,25 @@ function scheduleTryout(event: PullRequestEvent, target: TryoutTarget): void {
   const tag = `tryout ${repo}#${event.number}`;
   recovery.cancel(tryoutRecoveryKey(repo, event.number));
   const onFailure = (err: unknown): void => {
+    const key = tryoutRecoveryKey(repo, event.number);
     if (isSessionLimitError(err)) {
-      scheduleRecovery(tryoutRecoveryKey(repo, event.number), tag, err, () =>
-        scheduleTryout(event, target),
-      );
+      scheduleRecovery(key, tag, err, () => scheduleTryout(event, target));
+    } else if (isTransientApiFailure(err)) {
+      const attempt = transientAttempts.get(key) ?? 0;
+      const delay = redispatchDelayMs(attempt);
+      if (delay === null) {
+        clearTransientAttempts(key);
+        console.error(`💥 [${tag}] failed (transient API, ${attempt} re-dispatches exhausted):`, err);
+      } else {
+        transientAttempts.set(key, attempt + 1);
+        const at = new Date(Date.now() + delay);
+        console.error(
+          `💥 [${tag}] failed (transient API) — re-dispatch ${attempt + 1}/${REDISPATCH_DELAYS_MS.length} at ${at.toISOString()}`,
+        );
+        recovery.record(key, at, `${tag} (transient retry ${attempt + 1})`, () =>
+          scheduleTryout(event, target),
+        );
+      }
     } else {
       console.error(`💥 [${tag}] failed:`, err);
     }
@@ -173,6 +225,159 @@ function scheduleTryout(event: PullRequestEvent, target: TryoutTarget): void {
   next.finally(() => {
     if (tryoutQueues.get(repo) === next) tryoutQueues.delete(repo);
   });
+}
+
+// The shape of `gh api repos/<repo>/pulls/<n>` that we actually read. Kept as a
+// guard rather than a cast so a changed/failed response fails loudly here
+// instead of somewhere deep in a review run.
+type GhPullResponse = {
+  html_url: string;
+  title: string;
+  body?: string | null;
+  draft: boolean;
+  merged?: boolean;
+  merge_commit_sha?: string | null;
+  head: { sha: string; ref: string };
+  base: { ref: string; repo: { full_name: string; clone_url: string } };
+  user: { login: string; type: string };
+};
+
+function isGhPullResponse(payload: unknown): payload is GhPullResponse {
+  if (typeof payload !== 'object' || payload === null) return false;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.html_url !== 'string' || typeof p.title !== 'string') return false;
+  if (typeof p.draft !== 'boolean') return false;
+  if (p.body !== undefined && p.body !== null && typeof p.body !== 'string') return false;
+  if (p.merged !== undefined && typeof p.merged !== 'boolean') return false;
+  if (p.merge_commit_sha !== undefined && p.merge_commit_sha !== null
+      && typeof p.merge_commit_sha !== 'string') return false;
+  const head = p.head, base = p.base, user = p.user;
+  if (typeof head !== 'object' || head === null) return false;
+  if (typeof base !== 'object' || base === null) return false;
+  if (typeof user !== 'object' || user === null) return false;
+  const h = head as Record<string, unknown>;
+  const b = base as Record<string, unknown>;
+  const u = user as Record<string, unknown>;
+  if (typeof h.sha !== 'string' || typeof h.ref !== 'string') return false;
+  if (typeof b.ref !== 'string') return false;
+  const repo = b.repo;
+  if (typeof repo !== 'object' || repo === null) return false;
+  const r = repo as Record<string, unknown>;
+  if (typeof r.full_name !== 'string' || typeof r.clone_url !== 'string') return false;
+  if (typeof u.login !== 'string' || typeof u.type !== 'string') return false;
+  return true;
+}
+
+// Build the same synthetic `pull_request` event retrigger.mjs replays, but
+// in-process — an issue_comment payload carries no PR details, so we have to go
+// and fetch them. Keep the field mapping in step with retrigger.mjs.
+function fetchPullRequestEvent(
+  repo: string,
+  number: number,
+  ghBin: string,
+): Promise<PullRequestEvent> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ghBin, ['api', `repos/${repo}/pulls/${number}`], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code: number | null) => {
+      if (code !== 0) {
+        reject(new Error(`gh pull query failed (${code}): ${stderr.trim()}`));
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch (err: unknown) {
+        reject(new Error(`gh pull query produced invalid JSON: ${(err as Error).message}`));
+        return;
+      }
+      if (!isGhPullResponse(parsed)) {
+        reject(new Error(`gh pull query returned an unexpected shape for ${repo}#${number}`));
+        return;
+      }
+      const event: PullRequestEvent = {
+        action: 'synchronize',
+        number,
+        pull_request: {
+          html_url: parsed.html_url,
+          title: parsed.title,
+          body: parsed.body ?? null,
+          draft: parsed.draft,
+          merged: parsed.merged ?? false,
+          merge_commit_sha: parsed.merge_commit_sha ?? null,
+          head: { sha: parsed.head.sha, ref: parsed.head.ref },
+          base: { ref: parsed.base.ref },
+          user: { login: parsed.user.login, type: parsed.user.type },
+        },
+        repository: {
+          full_name: parsed.base.repo.full_name,
+          clone_url: parsed.base.repo.clone_url,
+        },
+      };
+      if (!isPullRequestEvent(event)) {
+        reject(new Error(`built an invalid pull_request event for ${repo}#${number}`));
+        return;
+      }
+      resolve(event);
+    });
+  });
+}
+
+// A `Continue tryout` comment on a release PR resumes its interrupted release
+// tryout. Returns the HTTP status to answer the webhook with.
+async function handleResumeComment(payload: unknown): Promise<number> {
+  if (!isIssueCommentEvent(payload)) return 400;
+  const repo = payload.repository.full_name;
+  const key = `${repo}#${payload.issue.number}`;
+
+  const skip = resumeSkipReason(payload);
+  if (skip !== null) {
+    // Once the hook is subscribed to issue_comment, every comment on every
+    // watched repo lands here — so the common path is a cheap, quiet skip.
+    if (skip !== 'no resume phrase' && skip !== 'not a pull request') {
+      console.log(`⏭️  skip resume ${key} (${skip})`);
+    }
+    return 200;
+  }
+
+  // Already running is the state the comment is asking for. schedulePR would
+  // abort the live run and restart it, throwing away whatever the agent has
+  // done since its last incremental .review.json write.
+  const running = slots.get(key);
+  if (running) {
+    console.log(`⏭️  skip resume ${key} (a ${running.kind} is already running)`);
+    return 200;
+  }
+
+  const repoTarget = TRYOUT_TARGETS[repo];
+  const releaseTarget: DeployedTryoutTarget | undefined =
+    repoTarget?.kind === 'deployed' && repoTarget.releaseBranch ? repoTarget : undefined;
+  if (!releaseTarget) {
+    console.log(`⏭️  skip resume ${key} (no release target configured for ${repo})`);
+    return 200;
+  }
+
+  const event = await fetchPullRequestEvent(repo, payload.issue.number, reviewConfig.ghBin);
+  if (event.pull_request.base.ref !== releaseTarget.releaseBranch) {
+    console.log(
+      `⏭️  skip resume ${key} (base=${event.pull_request.base.ref}, not ${releaseTarget.releaseBranch})`,
+    );
+    return 200;
+  }
+
+  console.log(
+    `▶️  [${key}] resuming release tryout on request from @${payload.comment.user.login}`,
+  );
+  clearTransientAttempts(key);
+  schedulePR(key, event, 'release-tryout', releaseTarget);
+  return 202;
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -240,6 +445,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
+  if (eventType === 'issue_comment') {
+    const status = await handleResumeComment(payload);
+    res.writeHead(status).end(status === 202 ? 'accepted\n' : status === 400 ? 'invalid payload\n' : 'ignored\n');
+    return;
+  }
+
   if (eventType !== 'pull_request') {
     res.writeHead(200).end('ignored\n');
     return;
@@ -265,6 +476,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   if (shouldReview(payload)) {
     matched = true;
+    // A real webhook is a fresh start: drop any transient-failure history so the
+    // re-dispatch schedule doesn't carry over from a previous SHA.
+    clearTransientAttempts(key);
     if (isReleasePR && releaseTarget) {
       console.log(`🚀 [${key}] queueing release tryout (base=${payload.pull_request.base.ref})`);
       schedulePR(key, payload, 'release-tryout', releaseTarget);
@@ -283,6 +497,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const base = payload.pull_request.base.ref;
       if (branches.includes(base)) {
         console.log(`🧪 [${key}] queueing tryout (merged into ${base})`);
+        clearTransientAttempts(tryoutRecoveryKey(payload.repository.full_name, payload.number));
         scheduleTryout(payload, target);
         routed = true;
       } else {

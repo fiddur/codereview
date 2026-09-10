@@ -166,9 +166,14 @@ async function readExistingReview(reviewPath: string): Promise<ReviewFile | null
   }
 }
 
-function annotateInterrupted(review: ReviewFile, totalItems: number): ReviewFile {
-  const checkedItems = review.checklist?.filter((c) => c.checked).length ?? 0;
-  const note = `_(release tryout interrupted — ${checkedItems}/${totalItems} items verified so far. Re-trigger the release tryout to resume on the remaining items.)_`;
+export function annotateInterrupted(review: ReviewFile, totalItems: number): ReviewFile {
+  // Index-guarded: an agent can write more checklist entries than the PR body
+  // has checkboxes (weloveblueai#651 wrote 23 for a 19-box body, and the note
+  // read "23/19"). applyChecklistToBody already ignores the surplus; count the
+  // same way so the number means something.
+  const checkedItems =
+    review.checklist?.filter((c) => c.checked && c.index < totalItems).length ?? 0;
+  const note = `_(release tryout interrupted — ${checkedItems}/${totalItems} items verified so far. To resume on the remaining items, add a comment on this PR containing \`Continue tryout\` on a line by itself.)_`;
   return {
     ...review,
     verdict: 'changes_required',

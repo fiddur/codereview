@@ -46,6 +46,42 @@ stale SHA is never re-fired. (`src/recovery.ts`; reset parsing in `src/run.ts`.)
 `retrigger-stale.sh` remains as a manual belt-and-braces sweep — it re-fires any
 open non-draft PR whose latest review is behind its head SHA.
 
+## Transient API failures
+
+A 529/overloaded burst is retried **in-process** first: `runClaudeWithRetry`
+gives four attempts over ~2 minutes (`src/run.ts`). An outage that outlasts that
+used to fall through to a plain `failed`, leaving the PR parked until a human
+re-fired it. It is now re-dispatched on a second, longer schedule — 5, then 15,
+then 45 minutes (`REDISPATCH_DELAYS_MS`) — through the same recovery scheduler
+the usage-limit path uses, so a release tryout still resumes from its partial
+`.review.json`. After the third re-dispatch the failure is reported as terminal.
+
+The event log distinguishes the two outcomes: `failed (retry scheduled)` while
+re-dispatches remain, `failed` once they are spent. Every branch writes exactly
+one terminal event, since watchers block on the log until one arrives.
+
+## Resuming an interrupted release tryout
+
+A release tryout that hits its timeout ceiling posts what it verified so far and
+asks to be resumed. To pull that trigger, **comment on the PR with `Continue
+tryout` on a line by itself**:
+
+```bash
+gh pr comment <number> --repo <owner/repo> --body 'Continue tryout'
+```
+
+The server re-enters the normal scheduling path, so the run resumes from the
+preserved `runDir` and its partial `.review.json` rather than starting over, and
+the usual `release tryout started` / `updated` lines appear in the event log.
+
+The phrase must be a whole line — a comment that merely mentions it in a
+sentence does not fire, which is what keeps the instructions above from
+triggering themselves. The comment author must be a non-bot `OWNER`, `MEMBER`
+or `COLLABORATOR`, and the PR must target a configured `releaseBranch`.
+
+This needs the GitHub webhook subscribed to **`issue_comment`** as well as
+`pull_request` (see Setup). `retrigger.mjs` stays as the manual fallback.
+
 ## How a tryout works (the agent writes its own scripts)
 
 The server doesn't ship a fixed test script per feature — it can't, because it
@@ -116,7 +152,9 @@ pnpm start                                      # tsx --env-file=.env src/server
 ```
 
 `gh` and `claude` must be installed and authenticated. Point a GitHub webhook
-(content type JSON or form-urlencoded) at `http://<host>:6666/github`.
+(content type JSON or form-urlencoded) at `http://<host>:6666/github`, subscribed
+to **`pull_request`** and **`issue_comment`** (the latter powers the
+`Continue tryout` resume trigger).
 
 Tryout targets (which repos get docker / release tryouts, and how) live in
 `src/targets.local.ts`, which is gitignored — `src/targets.example.ts` documents
