@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { isPullRequestEvent, shouldReview, shouldTryout, verifySignature, type PullRequestEvent } from './webhook.ts';
+import { isIssueCommentEvent, isPullRequestEvent, isResumeComment, resumeSkipReason, shouldReview, shouldTryout, type PullRequestEvent, verifySignature } from './webhook.ts';
 
 function makeEvent(overrides: Partial<{
   action: string;
@@ -93,4 +93,89 @@ test('shouldTryout false for closed without merge', () => {
 
 test('shouldTryout false for opened', () => {
   assert.equal(shouldTryout(makeEvent({ action: 'opened' })), false);
+});
+
+// --- resume comments ---------------------------------------------------------
+
+function makeComment(over: {
+  action?: string;
+  body?: string;
+  userType?: string;
+  association?: string;
+  isPr?: boolean;
+} = {}) {
+  const issue: { number: number; pull_request?: { url: string } } = { number: 651 };
+  if (over.isPr !== false) issue.pull_request = { url: 'https://api.github.com/pulls/651' };
+  return {
+    action: over.action ?? 'created',
+    issue,
+    comment: {
+      id: 1,
+      body: over.body ?? 'Continue tryout',
+      user: { login: 'fiddur', type: over.userType ?? 'User' },
+      author_association: over.association ?? 'OWNER',
+    },
+    repository: { full_name: 'weloveblue/weloveblueai', clone_url: 'https://github.com/weloveblue/weloveblueai.git' },
+  };
+}
+
+test('isIssueCommentEvent accepts a realistic payload', () => {
+  assert.equal(isIssueCommentEvent(makeComment()), true);
+});
+
+test('isIssueCommentEvent accepts a plain issue (no pull_request)', () => {
+  assert.equal(isIssueCommentEvent(makeComment({ isPr: false })), true);
+});
+
+test('isIssueCommentEvent rejects malformed payloads', () => {
+  assert.equal(isIssueCommentEvent(null), false);
+  assert.equal(isIssueCommentEvent({}), false);
+  const noBody = makeComment();
+  assert.equal(isIssueCommentEvent({ ...noBody, comment: { ...noBody.comment, body: 42 } }), false);
+  assert.equal(isIssueCommentEvent({ ...noBody, issue: { number: 'x' } }), false);
+  assert.equal(
+    isIssueCommentEvent({ ...noBody, comment: { ...noBody.comment, author_association: null } }),
+    false,
+  );
+});
+
+test('isResumeComment accepts the phrase on a line of its own', () => {
+  assert.equal(isResumeComment(makeComment({ body: 'Continue tryout' })), true);
+  assert.equal(isResumeComment(makeComment({ body: 'continue TRYOUT' })), true);
+  assert.equal(isResumeComment(makeComment({ body: '`Continue tryout`' })), true);
+  assert.equal(isResumeComment(makeComment({ body: '**Continue tryout**' })), true);
+  assert.equal(isResumeComment(makeComment({ body: '   Continue tryout   ' })), true);
+  assert.equal(
+    isResumeComment(makeComment({ body: 'Preview redeployed at abc123.\n\nContinue tryout\n' })),
+    true,
+  );
+});
+
+test('isResumeComment ignores the phrase mentioned inside a sentence', () => {
+  // This is the sentence the interrupted-review note itself is written in — a
+  // substring match would make the instructions fire the trigger.
+  const mention = 'To resume, add a comment containing `Continue tryout` on a line by itself.';
+  assert.equal(isResumeComment(makeComment({ body: mention })), false);
+  assert.equal(resumeSkipReason(makeComment({ body: mention })), 'no resume phrase');
+});
+
+test('resumeSkipReason names why a comment is ignored', () => {
+  assert.equal(resumeSkipReason(makeComment()), null);
+  assert.equal(resumeSkipReason(makeComment({ action: 'edited' })), 'action=edited');
+  assert.equal(resumeSkipReason(makeComment({ isPr: false })), 'not a pull request');
+  assert.equal(resumeSkipReason(makeComment({ userType: 'Bot' })), 'bot author');
+  assert.equal(
+    resumeSkipReason(makeComment({ association: 'NONE' })),
+    'author_association=NONE',
+  );
+  assert.equal(
+    resumeSkipReason(makeComment({ association: 'CONTRIBUTOR' })),
+    'author_association=CONTRIBUTOR',
+  );
+});
+
+test('isResumeComment accepts the associations that can actually trigger it', () => {
+  for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
+    assert.equal(isResumeComment(makeComment({ association })), true, association);
+  }
 });

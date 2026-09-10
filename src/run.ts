@@ -179,6 +179,19 @@ export function isTransientApiFailure(err: unknown): boolean {
 
 const RETRY_DELAYS_MS = [10_000, 30_000, 90_000];
 
+// Second tier, used by the server once the in-process ladder above is spent.
+// That ladder covers a blip (~2 minutes of retries); a 529 storm that outlasts
+// it needs a much longer wait, and the work has to survive it rather than being
+// dropped until a human notices. Bounded on purpose — after the last entry the
+// failure is reported as terminal.
+export const REDISPATCH_DELAYS_MS = [5 * 60_000, 15 * 60_000, 45 * 60_000];
+
+// 0-based attempt number → how long to wait before re-dispatching, or null when
+// the schedule is exhausted.
+export function redispatchDelayMs(attempt: number): number | null {
+  return REDISPATCH_DELAYS_MS[attempt] ?? null;
+}
+
 export async function runClaudeWithRetry(
   step: RunStep,
   logPrefix: string,

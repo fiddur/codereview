@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyChecklistToBody, parseChecklistFromBody } from './release.ts';
+import { annotateInterrupted, applyChecklistToBody, parseChecklistFromBody } from './release.ts';
 
 const SAMPLE = `# Release
 
@@ -63,4 +63,58 @@ test('applyChecklistToBody ignores indices it does not know about', () => {
     { index: 99, checked: true, evidence: '...' },
   ]);
   assert.equal(updated, SAMPLE);
+});
+
+test('annotateInterrupted ignores checklist entries the body has no box for', () => {
+  // weloveblueai#651: the agent wrote 23 entries against a 19-checkbox body and
+  // the note read "23/19". Surplus indices are already ignored when ticking, so
+  // they must not be counted either.
+  const checklist = Array.from({ length: 23 }, (_, index) => ({
+    index,
+    checked: true,
+    evidence: 'verified',
+  }));
+  const annotated = annotateInterrupted(
+    { verdict: 'approved', summary: 'All good.', comments: [], checklist },
+    19,
+  );
+  assert.match(annotated.summary, /19\/19 items verified/);
+  assert.ok(!annotated.summary.includes('23/19'));
+});
+
+test('annotateInterrupted counts only checked in-range items', () => {
+  const annotated = annotateInterrupted(
+    {
+      verdict: 'approved',
+      summary: 'Partial.',
+      comments: [],
+      checklist: [
+        { index: 0, checked: true, evidence: 'ok' },
+        { index: 1, checked: false, evidence: '(not yet verified)' },
+        { index: 2, checked: true, evidence: 'ok' },
+      ],
+    },
+    5,
+  );
+  assert.match(annotated.summary, /2\/5 items verified/);
+});
+
+test('annotateInterrupted downgrades the verdict and keeps the summary', () => {
+  const annotated = annotateInterrupted(
+    { verdict: 'approved', summary: 'Everything checked out.', comments: [], checklist: [] },
+    4,
+  );
+  assert.equal(annotated.verdict, 'changes_required');
+  assert.ok(annotated.summary.startsWith('Everything checked out.'));
+  assert.match(annotated.summary, /0\/4 items verified/);
+});
+
+test('annotateInterrupted tells the reader how to resume', () => {
+  const annotated = annotateInterrupted(
+    { verdict: 'approved', summary: 'Partial.', comments: [], checklist: [] },
+    3,
+  );
+  // The instruction has to name the exact phrase the server matches on.
+  assert.match(annotated.summary, /Continue tryout/);
+  assert.match(annotated.summary, /comment on this PR/);
 });

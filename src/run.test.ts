@@ -4,6 +4,8 @@ import {
   errText,
   isSessionLimitError,
   parseResetClock,
+  redispatchDelayMs,
+  REDISPATCH_DELAYS_MS,
   sessionLimitResetAt,
 } from './run.ts';
 
@@ -62,4 +64,21 @@ test('isSessionLimitError / errText', () => {
   assert.equal(isSessionLimitError(err), true);
   assert.match(errText(err), /session limit/);
   assert.equal(isSessionLimitError(new Error('some other failure')), false);
+});
+
+test('redispatchDelayMs walks the schedule then gives up', () => {
+  assert.equal(redispatchDelayMs(0), 5 * 60_000);
+  assert.equal(redispatchDelayMs(1), 15 * 60_000);
+  assert.equal(redispatchDelayMs(2), 45 * 60_000);
+  // Exhausted — the caller must report the failure as terminal rather than
+  // re-dispatching forever.
+  assert.equal(redispatchDelayMs(REDISPATCH_DELAYS_MS.length), null);
+  assert.equal(redispatchDelayMs(99), null);
+});
+
+test('redispatchDelayMs delays increase, so a long outage backs off', () => {
+  const delays = REDISPATCH_DELAYS_MS;
+  for (let i = 1; i < delays.length; i++) {
+    assert.ok((delays[i] ?? 0) > (delays[i - 1] ?? 0), `delay ${i} should exceed ${i - 1}`);
+  }
 });
