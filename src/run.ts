@@ -177,6 +177,21 @@ export function isTransientApiFailure(err: unknown): boolean {
   return TRANSIENT_PATTERNS.some((re) => re.test(txt));
 }
 
+// A quota attached to one model family, where switching models actually helps:
+// "You've reached your Fable limit. Switch to another model, or manage usage
+// credits at claude.ai/settings/usage…, to continue." The family is matched
+// generically rather than hard-coding Fable, so this keeps working if the
+// inherited model changes. Deliberately NOT the account-wide caps ("weekly
+// usage limit", "out of usage credits") — those follow you to every model, so a
+// fallback would just burn a second run; nor the session limit, which carries a
+// reset time and is handled by the recovery scheduler instead.
+const MODEL_QUOTA_RE = /reached your\s+(?:Fable|Mythos|Opus|Sonnet|Haiku)[\w\s.-]*\blimit\b/i;
+
+export function isModelQuotaError(err: unknown): boolean {
+  if (err instanceof AbortedError) return false;
+  return MODEL_QUOTA_RE.test(errText(err));
+}
+
 const RETRY_DELAYS_MS = [10_000, 30_000, 90_000];
 
 // Second tier, used by the server once the in-process ladder above is spent.
@@ -224,4 +239,45 @@ export async function runClaudeWithRetry(
     }
   }
   throw lastErr;
+}
+
+// The spawned command is either `claude …` (review) or `timeout <dur> claude …`
+// (tryout/release), so the flag goes on the end either way — the same place the
+// other flags already sit, after the `-p <prompt>` pair.
+export function withModel(step: RunStep, model: string): RunStep {
+  return { ...step, args: [...step.args, '--model', model] };
+}
+
+export function hasModelFlag(step: RunStep): boolean {
+  return step.args.includes('--model');
+}
+
+// Spawned agents inherit whatever model ~/.claude/settings.json pins, and that
+// model has its own weekly quota. When it runs out the CLI exits immediately
+// ("You've reached your Fable limit. Switch to another model…") — not a
+// transient failure the retry ladder can ride out, and not the account-wide
+// session limit the recovery scheduler waits out. The CLI's own
+// `--fallback-model` does not cover it (that handles "overloaded or not
+// available"), so re-run the whole step once on another model instead.
+export async function runClaudeWithFallback(
+  step: RunStep,
+  logPrefix: string,
+  fallbackModel: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    await runClaudeWithRetry(step, logPrefix, signal);
+  } catch (err: unknown) {
+    if (signal?.aborted || err instanceof AbortedError) throw err;
+    if (!fallbackModel || !isModelQuotaError(err)) throw err;
+    // Loop guard: an explicit --model means this step *is* the fallback run, so
+    // "reached your Opus limit" must not send us round again.
+    if (hasModelFlag(step)) throw err;
+    // Warn, not log: this changes what the run costs, so it has to be visible
+    // in server.out. No events.log line — watchers block on that log until a
+    // terminal event arrives, and a fallback is not terminal; the run still
+    // ends in the usual `updated` / `failed` line.
+    console.warn(`⚠️  [${logPrefix}] model quota exhausted — retrying this run on ${fallbackModel}`);
+    await runClaudeWithRetry(withModel(step, fallbackModel), logPrefix, signal);
+  }
 }

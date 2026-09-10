@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PullRequestEvent } from './webhook.ts';
-import { AbortedError, runClaudeWithRetry, runStep } from './run.ts';
+import { AbortedError, runClaudeWithFallback, runStep } from './run.ts';
 
 export { isAbortedError } from './run.ts';
 
@@ -11,6 +11,9 @@ export type ReviewConfig = {
   workBase: string;
   ghBin: string;
   claudeBin: string;
+  // Model to re-run on when the inherited model's own quota is exhausted.
+  // Unset disables the fallback (the failure stays terminal).
+  fallbackModel?: string;
   mcpConfig: string;
 };
 
@@ -358,7 +361,7 @@ export async function reviewPR(
   });
 
   try {
-    await runClaudeWithRetry(
+    await runClaudeWithFallback(
       {
         cmd: config.claudeBin,
         args: [
@@ -371,6 +374,7 @@ export async function reviewPR(
         cwd: workdir,
       },
       tag,
+      config.fallbackModel,
       signal,
     );
 

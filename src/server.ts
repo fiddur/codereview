@@ -22,10 +22,18 @@ const EVENT_LOG = process.env.EVENT_LOG ?? '/home/fiddur/src/codereview/events.l
 
 const MCP_CONFIG = process.env.MCP_CONFIG ?? '/home/fiddur/src/codereview/empty-mcp.json';
 
+// Where a run goes when the model it inherited from ~/.claude/settings.json has
+// burned its own quota (see runClaudeWithFallback). An explicit model ID, not
+// the `opus` alias, for the same reason the old ANTHROPIC_MODEL pin used one: an
+// alias silently moves between releases, and this is the safety net — it has to
+// be predictable.
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL ?? 'claude-opus-5';
+
 const reviewConfig: ReviewConfig = {
   workBase: process.env.WORK_BASE ?? '/home/fiddur/src/codereview/work',
   ghBin: process.env.GH_BIN ?? 'gh',
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
+  fallbackModel: FALLBACK_MODEL,
   mcpConfig: MCP_CONFIG,
 };
 
@@ -33,6 +41,7 @@ const tryoutConfig: TryoutConfig = {
   runsBase: process.env.TRYOUT_RUNS_BASE ?? '/home/fiddur/src/codereview/tryout/runs',
   ghBin: process.env.GH_BIN ?? 'gh',
   claudeBin: process.env.CLAUDE_BIN ?? 'claude',
+  fallbackModel: FALLBACK_MODEL,
   timeoutBin: process.env.TIMEOUT_BIN ?? '/usr/bin/timeout',
   timeoutDuration: process.env.TRYOUT_TIMEOUT ?? '30m',
   mcpConfigFallback: MCP_CONFIG,
