@@ -60,6 +60,25 @@ The event log distinguishes the two outcomes: `failed (retry scheduled)` while
 re-dispatches remain, `failed` once they are spent. Every branch writes exactly
 one terminal event, since watchers block on the log until one arrives.
 
+### Model-specific quota exhaustion
+
+A third, distinct failure: spawned agents inherit whatever model
+`~/.claude/settings.json` pins, and that model has a weekly quota of its own.
+When it runs out the CLI exits immediately with `You've reached your <model>
+limit. Switch to another model…`. That is neither a transient 529 (waiting does
+not help before the week turns over) nor the account-wide session limit (which
+carries a reset time and follows you to every model), so it gets its own
+handling: the run is retried **once** on `FALLBACK_MODEL`, default
+`claude-opus-5` — an explicit ID rather than the `opus` alias, so the safety net
+cannot silently move between releases. The switch is logged at warn level; it
+writes no event-log line, because a fallback is not a terminal outcome.
+
+The CLI's own `--fallback-model` does *not* cover this case — it handles
+"overloaded or not available", and a run with both flags still died on the
+exhausted quota. Account-wide caps (`weekly usage limit`, `out of usage
+credits`) are deliberately excluded from the match: no model switch can help
+there, so a fallback would just burn a second run.
+
 ## Resuming an interrupted release tryout
 
 A release tryout that hits its timeout ceiling posts what it verified so far and

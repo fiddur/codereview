@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PullRequestEvent } from './webhook.ts';
-import { AbortedError, isAbortedError, runClaudeWithRetry, runStep } from './run.ts';
+import { AbortedError, isAbortedError, runClaudeWithFallback, runStep } from './run.ts';
 import {
   ensureDemoToken,
   waitForDeployedCommit,
@@ -224,7 +224,7 @@ export async function releaseTryoutPR(
 
   let interrupted = false;
   try {
-    await runClaudeWithRetry(
+    await runClaudeWithFallback(
       {
         cmd: config.timeoutBin,
         args: [
@@ -239,6 +239,7 @@ export async function releaseTryoutPR(
         cwd: runDir,
       },
       tag,
+      config.fallbackModel,
       signal,
     );
   } catch (err: unknown) {

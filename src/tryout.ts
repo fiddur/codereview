@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PullRequestEvent } from './webhook.ts';
-import { AbortedError, runClaudeWithRetry, runStep } from './run.ts';
+import { AbortedError, runClaudeWithFallback, runStep } from './run.ts';
 
 export type TryoutMcp = {
   serverName: string;
@@ -88,6 +88,9 @@ export type TryoutConfig = {
   runsBase: string;
   ghBin: string;
   claudeBin: string;
+  // Model to re-run on when the inherited model's own quota is exhausted.
+  // Unset disables the fallback (the failure stays terminal).
+  fallbackModel?: string;
   timeoutBin: string;
   timeoutDuration: string;
   mcpConfigFallback: string;
@@ -473,7 +476,7 @@ export async function tryoutPR(
   const prompt = buildPrompt(event, target, mcpConfigPath !== config.mcpConfigFallback);
 
   const timeoutDuration = (target.kind === 'docker' && target.timeoutDuration) || config.timeoutDuration;
-  await runClaudeWithRetry(
+  await runClaudeWithFallback(
     {
       cmd: config.timeoutBin,
       args: [
@@ -488,6 +491,7 @@ export async function tryoutPR(
       cwd: runDir,
     },
     tag,
+    config.fallbackModel,
   );
 
   console.log(`✅ [${tag}] tryout complete`);

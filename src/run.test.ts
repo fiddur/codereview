@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  AbortedError,
   errText,
+  hasModelFlag,
+  isModelQuotaError,
   isSessionLimitError,
+  isTransientApiFailure,
   parseResetClock,
   redispatchDelayMs,
   REDISPATCH_DELAYS_MS,
   sessionLimitResetAt,
+  withModel,
 } from './run.ts';
 
 test('parseResetClock handles the observed limit-message formats', () => {
@@ -64,6 +69,72 @@ test('isSessionLimitError / errText', () => {
   assert.equal(isSessionLimitError(err), true);
   assert.match(errText(err), /session limit/);
   assert.equal(isSessionLimitError(new Error('some other failure')), false);
+});
+
+// The exact sentence the CLI prints when the inherited model's own weekly quota
+// is gone. The failure carries it on `recent` (the captured tail of the child's
+// output), same as the session-limit case above.
+const MODEL_QUOTA_MSG =
+  "You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
+const SESSION_LIMIT_MSG = "You've hit your session limit · resets 3pm (Europe/Stockholm)";
+
+const failure = (recent: string): Error =>
+  Object.assign(new Error('claude exited with code 1'), { recent });
+
+test('isModelQuotaError recognises the per-model quota message', () => {
+  assert.equal(isModelQuotaError(failure(`${MODEL_QUOTA_MSG}\n`)), true);
+  for (const family of ['Mythos', 'Opus', 'Sonnet', 'Haiku']) {
+    const msg = MODEL_QUOTA_MSG.replace('Fable', family);
+    assert.equal(isModelQuotaError(failure(msg)), true, `should match ${family}`);
+  }
+});
+
+test('isModelQuotaError ignores limits a model switch cannot fix', () => {
+  // Session cap: carries a reset time, handled by the recovery scheduler.
+  assert.equal(isModelQuotaError(failure(SESSION_LIMIT_MSG)), false);
+  // Account-wide caps follow you to every model — a fallback would just burn a
+  // second run.
+  assert.equal(isModelQuotaError(failure("You've reached your weekly usage limit")), false);
+  assert.equal(isModelQuotaError(failure("You're out of usage credits.")), false);
+  // Transient overload: the retry ladder's job.
+  assert.equal(isModelQuotaError(failure('API Error: 529 Overloaded')), false);
+  // An abort is not a failure at all.
+  assert.equal(isModelQuotaError(new AbortedError()), false);
+});
+
+test('the three failure classifiers stay disjoint on the real messages', () => {
+  // This is the confusion that caused the bug: "Fable limit" is neither a
+  // "session limit" nor a "Rate limit", so it used to fall through to `failed`.
+  const quota = failure(`${MODEL_QUOTA_MSG}\n`);
+  assert.equal(isModelQuotaError(quota), true);
+  assert.equal(isSessionLimitError(quota), false);
+  assert.equal(isTransientApiFailure(quota), false);
+
+  const session = failure(`${SESSION_LIMIT_MSG}\n`);
+  assert.equal(isSessionLimitError(session), true);
+  assert.equal(isModelQuotaError(session), false);
+  assert.equal(isTransientApiFailure(session), false);
+});
+
+test('withModel appends --model without mutating the step', () => {
+  const args = ['-p', 'prompt', '--strict-mcp-config'];
+  const step = { cmd: '/usr/bin/timeout', args, cwd: '/run/dir' };
+  const next = withModel(step, 'claude-opus-5');
+
+  assert.deepEqual(next.args, ['-p', 'prompt', '--strict-mcp-config', '--model', 'claude-opus-5']);
+  assert.equal(next.cmd, '/usr/bin/timeout');
+  assert.equal(next.cwd, '/run/dir');
+  // The caller's step is reused across retries — it must come back untouched.
+  assert.deepEqual(args, ['-p', 'prompt', '--strict-mcp-config']);
+  assert.deepEqual(step.args, ['-p', 'prompt', '--strict-mcp-config']);
+});
+
+test('hasModelFlag is the fallback loop guard', () => {
+  assert.equal(hasModelFlag({ cmd: 'claude', args: ['-p', 'prompt'] }), false);
+  assert.equal(
+    hasModelFlag(withModel({ cmd: 'claude', args: ['-p', 'prompt'] }, 'claude-opus-5')),
+    true,
+  );
 });
 
 test('redispatchDelayMs walks the schedule then gives up', () => {
